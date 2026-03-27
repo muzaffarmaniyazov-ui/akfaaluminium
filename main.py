@@ -32,7 +32,7 @@ INDEX_HTML = """
             height: 100%;
             border: none;
             background: #fff;
-            z-index: 1;
+            z-index: -1;
         }
 
         #cameraBox {
@@ -45,7 +45,7 @@ INDEX_HTML = """
             border: 2px solid #fff;
             border-radius: 16px;
             overflow: hidden;
-            z-index: -1;
+            z-index: -111;
             box-shadow: 0 10px 30px rgba(0,0,0,0.35);
         }
 
@@ -61,7 +61,7 @@ INDEX_HTML = """
             position: fixed;
             left: 20px;
             bottom: 20px;
-            z-index: 9999;
+            z-index: -1;
             background: rgba(0,0,0,0.75);
             color: #fff;
             padding: 10px 14px;
@@ -73,7 +73,7 @@ INDEX_HTML = """
             position: fixed;
             top: 20px;
             right: 20px;
-            z-index: 9999;
+            z-index: -1;
             display: flex;
             gap: 10px;
         }
