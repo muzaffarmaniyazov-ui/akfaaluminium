@@ -32,7 +32,7 @@ INDEX_HTML = """
             height: 100%;
             border: none;
             background: #fff;
-            z-index: -1;
+            z-index: 1;
         }
 
         #cameraBox {
@@ -73,7 +73,7 @@ INDEX_HTML = """
             position: fixed;
             top: 20px;
             right: 20px;
-            z-index: -1;
+            z-index: 1;
             display: flex;
             gap: 10px;
         }
