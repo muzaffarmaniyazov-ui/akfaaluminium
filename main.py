@@ -45,7 +45,7 @@ INDEX_HTML = """
             border: 2px solid #fff;
             border-radius: 16px;
             overflow: hidden;
-            z-index: 9999;
+            z-index: -1;
             box-shadow: 0 10px 30px rgba(0,0,0,0.35);
         }
 
