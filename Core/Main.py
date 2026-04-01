@@ -180,8 +180,7 @@ def main(page: Page):
 
 def Start(web=True):
     if web:
-        host = "0.0.0.0"
-port = int(os.environ.get("PORT", 8080))
+      host, port = '0.0.0.0', 8080
         banner(host, port)
         app(main, view='web_browser', host=host, port=port)
     else:
